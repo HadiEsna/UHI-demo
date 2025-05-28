@@ -1,0 +1,354 @@
+<!doctype html>
+<html>
+
+<head>
+    <meta charset="utf-8">
+    <title>Uniswap v4 Quoter - Reveal.js Demo</title>
+    <link rel="stylesheet" href="https://unpkg.com/reveal.js/dist/reveal.css">
+    <link rel="stylesheet" href="https://unpkg.com/reveal.js/dist/theme/black.css">
+    <link rel="stylesheet" href="https://unpkg.com/reveal.js/plugin/highlight/monokai.css">
+    <style>
+        .reveal {
+            background: linear-gradient(135deg, #1a0f3d 0%, #0a0012 50%, #070010 100%);
+        }
+
+        .reveal .slides {
+            background: transparent;
+        }
+
+        .reveal pre {
+            width: 100%;
+            max-width: 100%;
+            overflow-x: auto;
+            box-sizing: border-box;
+        }
+
+        .reveal pre code {
+            font-size: 0.55em !important;
+            line-height: 1.2;
+            max-width: 100%;
+            word-wrap: break-word;
+            white-space: pre-wrap;
+            overflow-wrap: break-word;
+            padding: 10px;
+            border-radius: 5px;
+        }
+
+        .reveal .hljs {
+            background: #272822 !important;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="reveal">
+        <div class="slides">
+
+            <section>
+                <h2>Simulating Swaps:<br>Uniswap v4 Quoter</h2>
+                <p>by Hadi Asna</p>
+            </section>
+
+            <section>
+                <h3>What You’ll Gain From This Session</h3>
+                <ul>
+                    <li>Understand how the v4 Quoter estimates the output/input of a swap</li>
+                    <li>Know how to use it in frontends and bots</li>
+                    <li>Learn the inner working of it</li>
+                    <li>Learn how to achive this functionality on-chain</li>
+                </ul>
+            </section>
+            <section>
+                <h3>What is the v4 Quoter and why?</h3>
+                <ul>
+                    <li>Simulates swaps without execution and returns the estimates output or required input</li>
+                    <li>Works off-chain via intentional reverts</li>
+                    <li>Not suitable for on-chain usage (not gas efficient)</li>
+                    <li>Used for frontends, bots, and strategy tools</li>
+                </ul>
+            </section>
+
+            <section>
+                <section>
+                    <h3>Request Flow Overview</h3>
+                    <p style="font-size: 0.9em">User → Quoter(Unlock) → Singleton Pool → Qouter(Swap and Revert) →
+                        Return Result
+                    </p>
+                    <p>Supports pool keys and hooks</p>
+                </section>
+
+                <section>
+                    <h3>Key Functions</h3>
+                    <ul>
+                        <li><code>quoteExactInputSingle</code></li>
+                        <li><code>quoteExactOutputSingle</code></li>
+                        <li><code>quoteExactInput</code> (multi-hop)</li>
+                        <li><code>quoteExactOutput</code> (multi-hop)</li>
+                    </ul>
+                </section>
+
+                <section>
+                    <h3>"quote Exact Input Single" example</h3>
+                    <pre><code class="javascript" data-line-numbers>let contract = new provider.eth.Contract(qouterABI, qouterAddress);
+let quote = await contract.methods.quoteExactInputSingle({
+    poolKey: {
+        currency0,
+        currency1,
+        fee: fee,
+        tickSpacing: tick,
+        hooks
+    },
+    zeroForOne: ZeroforOne === "true",
+    exactAmount: amount,
+    hookData
+}).call()
+                    </code></pre>
+                </section>
+
+                <section>
+                    <h3>Quoter Unlock</h3>
+                    <pre><code class="solidity" data-line-numbers="1-14|8">/// @inheritdoc IV4Quoter
+function quoteExactInputSingle(QuoteExactSingleParams memory params)
+    external
+    setMsgSender
+    returns (uint256 amountOut, uint256 gasEstimate)
+{
+    uint256 gasBefore = gasleft();
+    try poolManager.unlock(abi.encodeCall(this._quoteExactInputSingle, (params))) {}
+    catch (bytes memory reason) {
+        gasEstimate = gasBefore - gasleft();
+        // Extract the quote from QuoteSwap error, or throw if the quote failed
+        amountOut = reason.parseQuoteAmount();
+    }
+}
+                    </code></pre>
+                </section>
+
+                <section>
+                    <h3>Pool manager unlock mechanism</h3>
+                    <pre><code class="solidity" data-line-numbers="8">/// @inheritdoc IPoolManager
+function unlock(bytes calldata data) external override returns (bytes memory result) {
+    if (Lock.isUnlocked()) AlreadyUnlocked.selector.revertWith();
+
+    Lock.unlock();
+
+    // the caller does everything in this callback, including paying what they owe via calls to settle
+    result = IUnlockCallback(msg.sender).unlockCallback(data);
+
+    if (NonzeroDeltaCount.read() != 0) CurrencyNotSettled.selector.revertWith();
+    Lock.lock();
+}
+                    </code></pre>
+                </section>
+
+
+                <section>
+                    <h3>Quoter Swap and revert</h3>
+                    <pre><code class="solidity" data-line-numbers="2">function _unlockCallback(bytes calldata data) internal override returns (bytes memory) {
+        (bool success, bytes memory returnData) = address(this).call(data); // data = abi.encodeCall(this._quoteExactInputSingle, (params));
+        // Every quote path gathers a quote, and then reverts either with QuoteSwap(quoteAmount) or alternative error
+        if (success) revert UnexpectedCallSuccess();
+        // Bubble the revert string, whether a valid quote or an alternative error
+        returnData.bubbleReason();
+    }
+                    </code></pre>
+                    <pre><code class="solidity" data-line-numbers="1-9|3,4|8">/// @dev external function called within the _unlockCallback, to simulate a single-hop exact input swap, then revert with the result
+function _quoteExactInputSingle(QuoteExactSingleParams calldata params) external selfOnly returns (bytes memory) {
+    BalanceDelta swapDelta =
+        _swap(params.poolKey, params.zeroForOne, -int256(int128(params.exactAmount)), params.hookData);
+
+    // the output delta of a swap is positive
+    uint256 amountOut = params.zeroForOne ? uint128(swapDelta.amount1()) : uint128(swapDelta.amount0());
+    amountOut.revertQuote();
+}
+                    </code></pre>
+                </section>
+
+                <section>
+                    <div style="font-size: 0.42em;">
+                        <p style="margin-bottom: 6px;"><strong>Configure swap parameters:</strong></p>
+                        <div
+                            style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; max-width: 900px; margin: 0 auto;">
+                            <!-- PoolKey struct -->
+                            <fieldset style="border: 1px solid #444; padding: 5px; margin: 0; background: #222;">
+                                <legend style="font-size: 0.9em; color: #4CAF50;"><strong>PoolKey struct</strong>
+                                </legend>
+                                <div
+                                    style="display: grid; grid-template-columns: 80px 1fr; gap: 3px; align-items: center;">
+                                    <label>Currency0:</label> <input id="currency0" type="text"
+                                        value="0x0000000000000000000000000000000000000000"
+                                        style="width: 100%; font-size: 0.8em; padding: 2px;">
+                                    <label>Currency1:</label> <input id="currency1" type="text"
+                                        value="0xdac17f958d2ee523a2206206994597c13d831ec7"
+                                        style="width: 100%; font-size: 0.8em; padding: 2px;">
+                                    <label>Fee:</label> <input id="fee" type="number" value="3000"
+                                        style="width: 100%; font-size: 0.8em; padding: 2px;">
+                                    <label>Tick Spacing:</label> <input id="tickSpacing" type="number" value="60"
+                                        style="width: 100%; font-size: 0.8em; padding: 2px;">
+                                    <label>Hooks:</label> <input id="hooks" type="text"
+                                        value="0x0000000000000000000000000000000000000000"
+                                        style="width: 100%; font-size: 0.8em; padding: 2px;">
+                                </div>
+                            </fieldset>
+
+                            <!-- Other parameters -->
+                            <div style="border: 1px solid #444; padding: 5px; background: #222;">
+                                <div
+                                    style="display: grid; grid-template-columns: 80px 1fr; gap: 3px; align-items: center;">
+                                    <label>Zero for One:</label> <input id="zeroForOne" type="checkbox" checked>
+                                    <label>Exact Amount:</label> <input id="exactAmount" type="number"
+                                        value="1000000000000000000"
+                                        style="width: 100%; font-size: 0.8em; padding: 2px;">
+                                    <label>Hook Data:</label> <input id="hookData" type="text" value="0x"
+                                        style="width: 100%; font-size: 0.8em; padding: 2px;">
+                                </div>
+                                <button onclick="runQuote()"
+                                    style="width: 100%; margin-top: 6px; padding: 5px; font-size: 1em; background: #4CAF50; color: white; border: none; border-radius: 3px; cursor: pointer;">Run
+                                    Quote</button>
+                            </div>
+                        </div>
+
+                        <!-- Results area -->
+                        <div id="quoteResult"
+                            style="margin-top: 10px; padding: 8px; background: #1a1a1a; border: 1px solid #444; border-radius: 4px; font-size: 1.4em; min-height: 50px;">
+                        </div>
+                    </div>
+                </section>
+            </section>
+
+            <section>
+                <section>
+                    <h3>Some technical details</h3>
+                </section>
+                <section>
+                    <h3>Gas Cost calculation</h3>
+                    <pre><code class="solidity" data-line-numbers="7,10">/// @inheritdoc IV4Quoter
+function quoteExactInputSingle(QuoteExactSingleParams memory params)
+    external
+    setMsgSender
+    returns (uint256 amountOut, uint256 gasEstimate)
+{
+    uint256 gasBefore = gasleft();
+    try poolManager.unlock(abi.encodeCall(this._quoteExactInputSingle, (params))) {}
+    catch (bytes memory reason) {
+        gasEstimate = gasBefore - gasleft();
+        // Extract the quote from QuoteSwap error, or throw if the quote failed
+        amountOut = reason.parseQuoteAmount();
+    }
+}
+                    </code></pre>
+                </section>
+
+                <section>
+                    <h3>Revert library</h3>
+                    <pre><code class="solidity" data-line-numbers="2,8|14-18|20-25">/// @notice error thrown containing the quote as the data, to be caught and parsed later
+error QuoteSwap(uint256 amount);
+
+/// @notice reverts, where the revert data is the provided bytes
+/// @dev called when quoting, to record the quote amount in an error
+/// @dev QuoteSwap is used to differentiate this error from other errors thrown when simulating the swap
+function revertQuote(uint256 quoteAmount) internal pure {
+    revert QuoteSwap(quoteAmount);
+}
+
+/// @notice validates whether a revert reason is a valid swap quote or not
+/// if valid, it decodes the quote to return. Otherwise it reverts.
+function parseQuoteAmount(bytes memory reason) internal pure returns (uint256 quoteAmount) {
+    // If the error doesnt start with QuoteSwap, we know this isnt a valid quote to parse
+    // Instead it is another revert that was triggered somewhere in the simulation
+    if (reason.parseSelector() != QuoteSwap.selector) {
+        revert UnexpectedRevertBytes(reason);
+    }
+
+    // reason -> reason+0x1f is the length of the reason string
+    // reason+0x20 -> reason+0x23 is the selector of QuoteSwap
+    // reason+0x24 -> reason+0x43 is the quoteAmount
+    assembly ("memory-safe") {
+        quoteAmount := mload(add(reason, 0x24))
+    }
+}
+                    </code></pre>
+                </section>
+
+
+                <section>
+                    <h3>_swap function</h3>
+                    <pre><code class="solidity" data-line-numbers="7-15|18|19-21">/// @dev Execute a swap and return the balance delta
+/// @notice if amountSpecified < 0, the swap is exactInput, otherwise exactOutput
+function _swap(PoolKey memory poolKey, bool zeroForOne, int256 amountSpecified, bytes calldata hookData)
+    internal
+    returns (BalanceDelta swapDelta)
+{
+    swapDelta = poolManager.swap(
+        poolKey,
+        SwapParams({
+            zeroForOne: zeroForOne,
+            amountSpecified: amountSpecified,
+            sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+        }),
+        hookData
+    );
+
+    // Check that the pool was not illiquid.
+    int128 amountSpecifiedActual = (zeroForOne == (amountSpecified < 0)) ? swapDelta.amount0() : swapDelta.amount1();
+    if (amountSpecifiedActual != amountSpecified) {
+        revert NotEnoughLiquidity(poolKey.toId());
+    }
+}
+                    </code></pre>
+                </section>
+            </section>
+
+            <section>
+                <h3>on-chain alternative</h3>
+                <p>
+                    Two options for two secnarios:
+                <ul>
+                    <li>If you just need the price, use the StateLibrary (getSlot0 -> sqrtPriceX96)</li>
+                    <li>If you need to protect against slippage in a swap, use the sqrtPriceLimitX96</li>
+                </ul>
+                </p>
+            </section>
+
+            <section>
+                <div style="text-align: center;">
+                    <h2 style="color: #4CAF50; margin-bottom: 40px;">Thank You!</h2>
+                    <h3 style="margin-bottom: 30px;">Questions & Discussion</h3>
+                    <div
+                        style="background: rgba(255,255,255,0.1); padding: 20px; border-radius: 10px; margin: 20px auto; max-width: 500px;">
+                        <h4 style="color: #FF6B6B; margin-bottom: 15px;">Key Takeaways</h4>
+                        <p style="font-size: 0.7em; line-height: 1.4;">
+                            The v4 Quoter uses intentional reverts to simulate swaps off-chain,
+                            providing accurate estimates. <br>
+                            ❗️ only for off-chain use, not gas efficient for on-chain.
+                        </p>
+                    </div>
+
+                    <div style="margin-top: 40px;">
+                        <p style="font-size: 0.8em; color: #888;">
+                            Presentation by <strong style="color: #4CAF50;">Hadi Asna</strong>
+                        </p>
+                        <p style="font-size: 0.6em; margin-top: 20px;">
+                            Built with Reveal.js • Uniswap v4
+                        </p>
+                    </div>
+                </div>
+            </section>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/reveal.js/dist/reveal.js"></script>
+    <script src="https://unpkg.com/reveal.js/plugin/highlight/highlight.js"></script>
+    <script src="https://unpkg.com/reveal.js/plugin/zoom/zoom.js"></script>
+    <script src="./node_modules/ethers/dist/ethers.umd.min.js"></script>
+    <script>
+        Reveal.initialize({
+            hash: true,
+            slideNumber: true,
+            plugins: [RevealHighlight, RevealZoom]
+        });
+    </script>
+    <script src="scripts.js" type="module"></script>
+</body>
+
+</html>
